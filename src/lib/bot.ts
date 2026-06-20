@@ -3,47 +3,51 @@ import { createTelegramAdapter } from "@chat-adapter/telegram";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { extractTikTokUrls, downloadTikTok } from "./tiktok";
 
-let _bot: Chat<{ telegram: ReturnType<typeof createTelegramAdapter> }> | null =
-  null;
+let _bot: Chat<{ telegram: ReturnType<typeof createTelegramAdapter> }> | null = null;
 
-/**
- * Send a video buffer directly via Telegram Bot API (multipart/form-data).
- * Bypasses chat-sdk for the file upload since the adapter's abstraction
- * for binary video uploads is unreliable.
- */
-async function sendVideoToTelegram(
-  chatId: string | number,
+// ── Direct Telegram API helpers ───────────────────────────────────────────────
+
+async function tgPost(method: string, body: Record<string, unknown>): Promise<Response> {
+  const token = process.env.TELEGRAM_BOT_TOKEN!;
+  return fetch(`https://api.telegram.org/bot${token}/${method}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+async function sendText(chatId: number | string, text: string, replyTo?: number) {
+  return tgPost("sendMessage", {
+    chat_id: chatId,
+    text,
+    ...(replyTo ? { reply_to_message_id: replyTo } : {}),
+  });
+}
+
+async function sendVideo(
+  chatId: number | string,
   buffer: Buffer,
   filename: string,
-  caption?: string,
-  replyToMessageId?: number
-): Promise<void> {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  if (!token) throw new Error("TELEGRAM_BOT_TOKEN not set");
-
+  replyTo?: number
+) {
+  const token = process.env.TELEGRAM_BOT_TOKEN!;
   const form = new FormData();
   form.append("chat_id", String(chatId));
-  form.append(
-    "video",
-    new Blob([new Uint8Array(buffer)], { type: "video/mp4" }),
-    filename
-  );
-  if (caption) form.append("caption", caption);
-  if (replyToMessageId)
-    form.append("reply_to_message_id", String(replyToMessageId));
-  // Let Telegram generate the thumbnail
+  form.append("video", new Blob([new Uint8Array(buffer)], { type: "video/mp4" }), filename);
   form.append("supports_streaming", "true");
+  if (replyTo) form.append("reply_to_message_id", String(replyTo));
 
-  const res = await fetch(
-    `https://api.telegram.org/bot${token}/sendVideo`,
-    { method: "POST", body: form }
-  );
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`sendVideo failed ${res.status}: ${err}`);
-  }
+  return fetch(`https://api.telegram.org/bot${token}/sendVideo`, {
+    method: "POST",
+    body: form,
+  });
 }
+
+async function deleteMsg(chatId: number | string, messageId: number) {
+  return tgPost("deleteMessage", { chat_id: chatId, message_id: messageId });
+}
+
+// ── Bot factory ───────────────────────────────────────────────────────────────
 
 export function getBot() {
   if (_bot) return _bot;
@@ -54,87 +58,78 @@ export function getBot() {
     state: createMemoryState(),
   });
 
-  // We need access to the raw Telegram chat_id and message_id from the
-  // incoming update. chat-sdk exposes them via message.raw (platform payload).
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   type AnyMsg = any;
   type BotThread = Parameters<Parameters<typeof _bot.onNewMessage>[1]>[0];
 
+  // ── Extract chat_id and message_id from the raw Telegram payload ──
+  function getRaw(message: AnyMsg): { chatId: number | string; msgId?: number } {
+    const raw = message?.raw ?? {};
+    // raw may be the message object directly, or wrapped under .message
+    const chatId: number | string =
+      raw?.chat?.id ??
+      raw?.message?.chat?.id ??
+      raw?.channel_post?.chat?.id ??
+      0;
+    const msgId: number | undefined =
+      raw?.message_id ??
+      raw?.message?.message_id ??
+      raw?.channel_post?.message_id;
+    return { chatId, msgId };
+  }
+
   async function handleMessage(thread: BotThread, message: AnyMsg) {
-    const text: string = message.text ?? "";
+    const text: string = message?.text ?? message?.raw?.text ?? "";
     const urls = extractTikTokUrls(text);
     if (urls.length === 0) return;
 
-    // Extract chat_id and message_id from the raw Telegram payload
-    // so we can call sendVideo directly and reply to the original message
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const raw: any = message.raw ?? {};
-    const chatId: string | number =
-      raw?.chat?.id ?? raw?.message?.chat?.id ?? thread.id;
-    const messageId: number | undefined =
-      raw?.message_id ?? raw?.message?.message_id;
+    const { chatId, msgId } = getRaw(message);
+
+    // Fallback: use thread.id if raw extraction gives 0
+    const effectiveChatId = chatId || thread.id;
 
     for (const url of urls) {
-      // Send acknowledgement via chat-sdk (plain text — always works)
-      let statusId: number | undefined;
+      // Send "Downloading…" acknowledgement
+      let statusMsgId: number | undefined;
       try {
-        const token = process.env.TELEGRAM_BOT_TOKEN!;
-        const ackRes = await fetch(
-          `https://api.telegram.org/bot${token}/sendMessage`,
-          {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              chat_id: chatId,
-              text: "⏬ Downloading…",
-              ...(messageId ? { reply_to_message_id: messageId } : {}),
-            }),
-          }
-        );
+        const ackRes = await sendText(effectiveChatId, "⏬ Downloading…", msgId);
         if (ackRes.ok) {
           const ackJson = await ackRes.json() as { result?: { message_id?: number } };
-          statusId = ackJson.result?.message_id;
+          statusMsgId = ackJson.result?.message_id;
         }
-      } catch { /* non-critical */ }
+      } catch (e) {
+        console.error("ack send failed:", e);
+      }
 
       try {
         const { buffer, filename } = await downloadTikTok(url);
 
-        await sendVideoToTelegram(chatId, buffer, filename, undefined, messageId);
+        const sendRes = await sendVideo(effectiveChatId, buffer, filename, msgId);
+        const sendJson = await sendRes.json() as { ok: boolean; description?: string };
 
-        // Delete the "Downloading…" status message
-        if (statusId) {
-          const token = process.env.TELEGRAM_BOT_TOKEN!;
-          await fetch(
-            `https://api.telegram.org/bot${token}/deleteMessage`,
-            {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({ chat_id: chatId, message_id: statusId }),
-            }
-          ).catch(() => {});
+        if (!sendJson.ok) {
+          throw new Error(`sendVideo API error: ${sendJson.description}`);
+        }
+
+        // Clean up status message
+        if (statusMsgId) {
+          await deleteMsg(effectiveChatId, statusMsgId).catch(() => {});
         }
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error("TikTok handler error:", msg);
-
-        const token = process.env.TELEGRAM_BOT_TOKEN;
-        if (token) {
-          await fetch(
-            `https://api.telegram.org/bot${token}/sendMessage`,
-            {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({
-                chat_id: chatId,
-                text: `❌ Failed to download: ${msg.slice(0, 200)}`,
-              }),
-            }
-          ).catch(() => {});
-        }
+        const errMsg = err instanceof Error ? err.message : String(err);
+        console.error("TikTok handler error:", errMsg);
+        await sendText(effectiveChatId, `❌ Failed: ${errMsg.slice(0, 500)}`).catch(() => {});
       }
     }
   }
+
+  // ── /start → echo chat ID (useful for debugging) ──────────────────────────
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  _bot.onNewMessage(/^\/start/, async (thread: BotThread, message: AnyMsg) => {
+    const { chatId } = getRaw(message);
+    const effectiveChatId = chatId || thread.id;
+    await sendText(effectiveChatId, `👋 Send me a TikTok link!\n\nYour chat ID: ${effectiveChatId}`);
+  });
 
   const TIKTOK_PATTERN =
     /https?:\/\/(www\.)?(tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com)[^\s<>"']*/i;
