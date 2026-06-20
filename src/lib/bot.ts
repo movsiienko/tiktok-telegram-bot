@@ -1,70 +1,77 @@
 import { Chat } from "chat";
 import { createTelegramAdapter } from "@chat-adapter/telegram";
+import { createMemoryState } from "@chat-adapter/state-memory";
 import { extractTikTokUrls, downloadTikTok } from "./tiktok";
 
-export const bot = new Chat({
-  userName: process.env.TELEGRAM_BOT_USERNAME ?? "tiktokbot",
-  adapters: {
-    telegram: createTelegramAdapter(),
-  },
-});
+// ─── Lazy singleton ───────────────────────────────────────────────────────────
+// We build the bot lazily (on first request) so that the adapter does not
+// validate env vars at module-load / build time.
 
-// ─── Shared handler ──────────────────────────────────────────────────────────
+let _bot: Chat<{ telegram: ReturnType<typeof createTelegramAdapter> }> | null =
+  null;
 
-async function handleMessage(
-  thread: Parameters<Parameters<typeof bot.onNewMessage>[1]>[0],
-  message: { text?: string }
-) {
-  const text = message.text ?? "";
-  const urls = extractTikTokUrls(text);
+export function getBot() {
+  if (_bot) return _bot;
 
-  if (urls.length === 0) return;
+  _bot = new Chat({
+    userName: process.env.TELEGRAM_BOT_USERNAME ?? "tiktokbot",
+    adapters: {
+      telegram: createTelegramAdapter(),
+    },
+    state: createMemoryState(),
+  });
 
-  for (const url of urls) {
-    try {
-      await thread.post("⏬ Downloading TikTok video…");
+  // ─── Handlers ─────────────────────────────────────────────────────────────
 
-      const { buffer, filename } = await downloadTikTok(url);
+  type BotThread = Parameters<Parameters<typeof _bot.onNewMessage>[1]>[0];
+  type BotMessage = Parameters<Parameters<typeof _bot.onNewMessage>[1]>[1];
 
-      await thread.post({
-        markdown: "Here's your video:",
-        files: [{ data: buffer, filename }],
-      });
-    } catch (err) {
-      console.error("TikTok download error:", err);
-      await thread.post(
-        "Sorry, I couldn't download that video. It may be private, geo-restricted, or too large."
-      );
+  async function handleMessage(thread: BotThread, message: BotMessage) {
+    const text = message.text ?? "";
+    const urls = extractTikTokUrls(text);
+
+    if (urls.length === 0) return;
+
+    for (const url of urls) {
+      try {
+        await thread.post("⏬ Downloading TikTok video…");
+
+        const { buffer, filename } = await downloadTikTok(url);
+
+        await thread.post({
+          markdown: "Here's your video:",
+          files: [{ data: buffer, filename }],
+        });
+      } catch (err) {
+        console.error("TikTok download error:", err);
+        await thread.post(
+          "Sorry, I couldn't download that video. It may be private, geo-restricted, or too large (50 MB limit)."
+        );
+      }
     }
   }
+
+  /**
+   * Catch any message in an unsubscribed thread that contains a TikTok URL.
+   * This covers groups, supergroups (including t.me/group/519 topic threads),
+   * channel posts the bot is admin of, etc.
+   */
+  const TIKTOK_PATTERN =
+    /https?:\/\/(www\.)?(tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com)[^\s<>"']*/i;
+
+  _bot.onNewMessage(TIKTOK_PATTERN, async (thread, message) => {
+    await handleMessage(thread, message);
+  });
+
+  /** TikTok links sent as direct messages / private chats. */
+  _bot.onDirectMessage(async (thread, message) => {
+    await handleMessage(thread, message);
+  });
+
+  /** When someone @-mentions the bot together with a TikTok link. */
+  _bot.onNewMention(async (thread, message) => {
+    await handleMessage(thread, message);
+  });
+
+  return _bot;
 }
-
-// ─── Handlers ─────────────────────────────────────────────────────────────────
-
-/**
- * Catch any message in an unsubscribed thread that contains a TikTok URL.
- * This covers:
- *  - Group / supergroup messages (including topic threads like t.me/group/519)
- *  - Channel posts the bot is admin of
- *  - Any other chat type where the bot receives messages
- */
-const TIKTOK_PATTERN =
-  /https?:\/\/(www\.)?(tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com)[^\s<>"']*/i;
-
-bot.onNewMessage(TIKTOK_PATTERN, async (thread, message) => {
-  await handleMessage(thread, message);
-});
-
-/**
- * Handle TikTok links sent in direct messages / private chats.
- */
-bot.onDirectMessage(async (thread, message) => {
-  await handleMessage(thread, message);
-});
-
-/**
- * Handle TikTok links when someone @-mentions the bot with a link.
- */
-bot.onNewMention(async (thread, message) => {
-  await handleMessage(thread, message);
-});
