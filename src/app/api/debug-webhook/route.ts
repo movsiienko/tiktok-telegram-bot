@@ -34,6 +34,33 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json(json);
   }
 
+  // ── get_updates (drops webhook temporarily) ─────────────────────────────────
+  if (body.action === "get_updates") {
+    // Delete webhook to allow getUpdates
+    await fetch(`https://api.telegram.org/bot${token}/deleteWebhook?drop_pending_updates=false`);
+    // Fetch updates
+    const updRes = await fetch(`https://api.telegram.org/bot${token}/getUpdates?limit=5&timeout=2`);
+    const updJson = await updRes.json() as { ok: boolean; result?: Array<{ message?: { chat?: { id: number; username?: string }; text?: string }; update_id: number }> };
+    // Restore webhook
+    await fetch(`https://api.telegram.org/bot${token}/setWebhook`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        url: "https://tiktok-telegram-bot.vercel.app/api/webhooks/telegram",
+        secret_token: process.env.TELEGRAM_WEBHOOK_SECRET_TOKEN,
+        allowed_updates: ["message", "channel_post", "edited_message", "edited_channel_post"],
+      }),
+    });
+    // Return only chat IDs and texts (no sensitive data)
+    const summary = (updJson.result ?? []).map(u => ({
+      update_id: u.update_id,
+      chat_id: u.message?.chat?.id,
+      username: u.message?.chat?.username,
+      text: u.message?.text?.slice(0, 80),
+    }));
+    return Response.json({ ok: updJson.ok, updates: summary });
+  }
+
   // ── Full pipeline test ──────────────────────────────────────────────────────
   const { url, chat_id } = body;
   if (!url || chat_id === undefined || chat_id === null) {
