@@ -1,26 +1,10 @@
-import { execFile } from "child_process";
-import { readFile, unlink } from "fs/promises";
-import { join } from "path";
-import { promisify } from "util";
-
-const execFileAsync = promisify(execFile);
-
 const TIKTOK_REGEX =
   /https?:\/\/(www\.)?(tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com)[^\s<>"']*/gi;
 
-/**
- * Extract all TikTok URLs from a string.
- */
 export function extractTikTokUrls(text: string): string[] {
-  const matches = text.match(TIKTOK_REGEX);
-  return matches ?? [];
-}
-
-/**
- * Check whether a string contains at least one TikTok URL.
- */
-export function hasTikTokUrl(text: string): boolean {
-  return TIKTOK_REGEX.test(text);
+  // Reset lastIndex since we reuse the regex
+  TIKTOK_REGEX.lastIndex = 0;
+  return text.match(TIKTOK_REGEX) ?? [];
 }
 
 export interface DownloadResult {
@@ -28,46 +12,79 @@ export interface DownloadResult {
   filename: string;
 }
 
+interface TikwmResponse {
+  code: number;
+  msg: string;
+  data?: {
+    id: string;
+    title: string;
+    play: string;       // no-watermark MP4 URL
+    wmplay: string;     // watermarked URL
+    hdplay: string;     // HD no-watermark URL
+    size: number;
+    duration: number;
+  };
+}
+
 /**
- * Download a TikTok video using yt-dlp and return it as a Buffer.
- * Falls back to sending only the URL if download fails.
+ * Resolve a TikTok URL to a direct MP4 download link via tikwm.com,
+ * then stream it into a Buffer. No binary dependencies required.
  */
 export async function downloadTikTok(url: string): Promise<DownloadResult> {
-  const outputPath = join("/tmp", `tiktok-${Date.now()}-%(id)s.%(ext)s`);
-  const resolvedTemplate = join("/tmp", `tiktok-${Date.now()}`);
+  // Step 1: get metadata + no-watermark URL from tikwm API
+  const apiUrl = new URL("https://www.tikwm.com/api/");
+  apiUrl.searchParams.set("url", url);
+  apiUrl.searchParams.set("hd", "1");
 
-  // Resolve yt-dlp binary — prefer the one shipped with yt-dlp-wrap,
-  // but fall back to whatever is on PATH.
-  let ytDlpBin = "yt-dlp";
-  try {
-    // yt-dlp-wrap bundles a binary path helper
-    const wrap = await import("yt-dlp-wrap");
-    const WrapClass = wrap.default ?? wrap;
-    const instance = new WrapClass();
-    ytDlpBin = (instance as { ytDlpBinaryPath?: string }).ytDlpBinaryPath ?? "yt-dlp";
-  } catch {
-    // ignore — fall back to PATH yt-dlp
+  const metaRes = await fetch(apiUrl.toString(), {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (compatible; TikTok-Telegram-Bot/1.0)",
+    },
+    // short redirect chain for vm.tiktok.com links
+    redirect: "follow",
+  });
+
+  if (!metaRes.ok) {
+    throw new Error(`tikwm API returned HTTP ${metaRes.status}`);
   }
 
-  const actualOutput = `${resolvedTemplate}.mp4`;
+  const meta: TikwmResponse = await metaRes.json();
 
-  await execFileAsync(ytDlpBin, [
-    url,
-    "-o",
-    `${resolvedTemplate}.%(ext)s`,
-    "--format",
-    "mp4/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-    "--merge-output-format",
-    "mp4",
-    "--no-playlist",
-    "--max-filesize",
-    "49m", // keep safely under Telegram's 50 MB bot limit
-    "--no-warnings",
-    "--quiet",
-  ]);
+  if (meta.code !== 0 || !meta.data) {
+    throw new Error(`tikwm error: ${meta.msg ?? "unknown"}`);
+  }
 
-  const buffer = await readFile(actualOutput);
-  await unlink(actualOutput).catch(() => {});
+  // Prefer HD no-watermark, fall back to standard no-watermark
+  const videoUrl = meta.data.hdplay || meta.data.play;
 
-  return { buffer, filename: "tiktok.mp4" };
+  if (!videoUrl) {
+    throw new Error("No download URL returned by tikwm");
+  }
+
+  // Step 2: download the actual video bytes
+  const videoRes = await fetch(videoUrl, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (compatible; TikTok-Telegram-Bot/1.0)",
+      Referer: "https://www.tiktok.com/",
+    },
+    redirect: "follow",
+  });
+
+  if (!videoRes.ok) {
+    throw new Error(`Video download returned HTTP ${videoRes.status}`);
+  }
+
+  const arrayBuffer = await videoRes.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+
+  // Sanitise title for filename
+  const safeTitle = (meta.data.title ?? "tiktok")
+    .replace(/[^\w\s-]/g, "")
+    .trim()
+    .replace(/\s+/g, "_")
+    .slice(0, 60);
+
+  return { buffer, filename: `${safeTitle || "tiktok"}.mp4` };
 }
